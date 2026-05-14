@@ -24,24 +24,9 @@ const pool = new Pool({
 });
 
 const PLANS = {
-  Basic: {
-    price: 15,
-    min_withdraw: 3,
-    reward: 1.2,
-    rank: 1
-  },
-  Plus: {
-    price: 60,
-    min_withdraw: 20,
-    reward: 8.2,
-    rank: 2
-  },
-  Pro: {
-    price: 100,
-    min_withdraw: 35,
-    reward: 12,
-    rank: 3
-  }
+  Basic: { price: 15, min_withdraw: 3, reward: 1.2, rank: 1 },
+  Plus: { price: 60, min_withdraw: 20, reward: 8.2, rank: 2 },
+  Pro: { price: 100, min_withdraw: 35, reward: 12, rank: 3 }
 };
 
 const DEPOSIT_NETWORKS = {
@@ -387,17 +372,10 @@ app.post("/api/user", requireTelegramAuth, async (req, res) => {
       user = result.rows[0];
     }
 
-    res.json({
-      ok: true,
-      user
-    });
+    res.json({ ok: true, user });
   } catch (err) {
     console.error(err);
-
-    res.status(500).json({
-      ok: false,
-      message: "Server error"
-    });
+    res.status(500).json({ ok: false, message: "Server error" });
   }
 });
 
@@ -467,11 +445,7 @@ app.post("/api/select-plan", requireTelegramAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-
-    res.status(500).json({
-      ok: false,
-      message: "Server error"
-    });
+    res.status(500).json({ ok: false, message: "Server error" });
   }
 });
 
@@ -583,11 +557,7 @@ app.post("/api/deposit", requireTelegramAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-
-    res.status(500).json({
-      ok: false,
-      message: "Server error"
-    });
+    res.status(500).json({ ok: false, message: "Server error" });
   }
 });
 
@@ -603,10 +573,7 @@ app.post("/api/complete-task", requireTelegramAuth, async (req, res) => {
     const user = userResult.rows[0];
 
     if (!user) {
-      return res.status(404).json({
-        ok: false,
-        message: "User not found"
-      });
+      return res.status(404).json({ ok: false, message: "User not found" });
     }
 
     if (user.plan === "none") {
@@ -652,11 +619,7 @@ app.post("/api/complete-task", requireTelegramAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-
-    res.status(500).json({
-      ok: false,
-      message: "Server error"
-    });
+    res.status(500).json({ ok: false, message: "Server error" });
   }
 });
 
@@ -687,24 +650,15 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
     const user = userResult.rows[0];
 
     if (!user) {
-      return res.status(404).json({
-        ok: false,
-        message: "User not found"
-      });
+      return res.status(404).json({ ok: false, message: "User not found" });
     }
 
     if (user.plan === "none") {
-      return res.status(400).json({
-        ok: false,
-        message: "Select a plan first"
-      });
+      return res.status(400).json({ ok: false, message: "Select a plan first" });
     }
 
     if (numericAmount > Number(user.balance)) {
-      return res.status(400).json({
-        ok: false,
-        message: "Insufficient balance"
-      });
+      return res.status(400).json({ ok: false, message: "Insufficient balance" });
     }
 
     const isFirstWithdrawal = !user.last_withdrawal_at;
@@ -794,11 +748,7 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-
-    res.status(500).json({
-      ok: false,
-      message: "Server error"
-    });
+    res.status(500).json({ ok: false, message: "Server error" });
   }
 });
 
@@ -875,7 +825,6 @@ app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -915,13 +864,9 @@ app.post("/api/admin/deposits/:id/reject", requireAdmin, async (req, res) => {
       return { deposit };
     });
 
-    res.json({
-      ok: true,
-      deposit: data.deposit
-    });
+    res.json({ ok: true, deposit: data.deposit });
   } catch (err) {
     console.error(err);
-
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -960,13 +905,9 @@ app.post("/api/admin/withdrawals/:id/approve", requireAdmin, async (req, res) =>
       return { withdrawal };
     });
 
-    res.json({
-      ok: true,
-      withdrawal: data.withdrawal
-    });
+    res.json({ ok: true, withdrawal: data.withdrawal });
   } catch (err) {
     console.error(err);
-
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -1016,7 +957,53 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
     });
   } catch (err) {
     console.error(err);
+    res.status(err.statusCode || 500).json({
+      ok: false,
+      message: err.message || "Server error"
+    });
+  }
+});
 
+app.post("/api/admin/users/:telegram_id/delete", requireAdmin, async (req, res) => {
+  try {
+    const telegramId = String(req.params.telegram_id);
+
+    const data = await withTransaction(async (client) => {
+      await client.query(
+        `DELETE FROM withdrawals WHERE telegram_id = $1`,
+        [telegramId]
+      );
+
+      await client.query(
+        `DELETE FROM deposits WHERE telegram_id = $1`,
+        [telegramId]
+      );
+
+      const deletedUser = await client.query(
+        `DELETE FROM users
+         WHERE telegram_id = $1
+         RETURNING *`,
+        [telegramId]
+      );
+
+      if (!deletedUser.rows[0]) {
+        const error = new Error("User not found");
+        error.statusCode = 404;
+        throw error;
+      }
+
+      return {
+        user: deletedUser.rows[0]
+      };
+    });
+
+    res.json({
+      ok: true,
+      message: "User deleted",
+      user: data.user
+    });
+  } catch (err) {
+    console.error(err);
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -1040,11 +1027,7 @@ app.get("/api/admin", requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-
-    res.status(500).json({
-      ok: false,
-      message: "Server error"
-    });
+    res.status(500).json({ ok: false, message: "Server error" });
   }
 });
 

@@ -10,10 +10,23 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+if (!process.env.DATABASE_URL) {
+  console.error("DATABASE_URL is missing");
+  process.exit(1);
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: process.env.DATABASE_URL.includes("localhost")
+    ? false
+    : { rejectUnauthorized: false }
 });
+
+const PLANS = {
+  Basic: { min_withdraw: 5 },
+  Plus: { min_withdraw: 20 },
+  Pro: { min_withdraw: 35 }
+};
 
 async function initDB() {
   await pool.query(`
@@ -52,7 +65,42 @@ async function initDB() {
     )
   `);
 
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS pending_plan TEXT DEFAULT 'none'
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS pending_min_withdraw NUMERIC(12,2) DEFAULT 0
+  `);
+
+  await pool.query(`
+    ALTER TABLE deposits
+    ADD COLUMN IF NOT EXISTS requested_plan TEXT DEFAULT 'none'
+  `);
+
   console.log("Database ready");
+}
+
+function requireAdmin(req, res, next) {
+  const key = req.query.key || req.headers["x-admin-key"];
+
+  if (!process.env.ADMIN_KEY) {
+    return res.status(500).json({
+      ok: false,
+      message: "ADMIN_KEY is missing"
+    });
+  }
+
+  if (key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({
+      ok: false,
+      message: "Unauthorized"
+    });
+  }
+
+  next();
 }
 
 app.get("/", (req, res) => {
@@ -67,7 +115,10 @@ app.post("/api/user", async (req, res) => {
     const { telegram_id, first_name, username } = req.body;
 
     if (!telegram_id) {
-      return res.status(400).json({ ok: false, message: "telegram_id is required" });
+      return res.status(400).json({
+        ok: false,
+        message: "telegram_id is required"
+      });
     }
 
     let result = await pool.query(
@@ -99,29 +150,34 @@ app.post("/api/select-plan", async (req, res) => {
   try {
     const { telegram_id, plan } = req.body;
 
-    const plans = {
-      Basic: 5,
-      Plus: 20,
-      Pro: 35
-    };
-
-    if (!telegram_id || !plans[plan]) {
-      return res.status(400).json({ ok: false, message: "Invalid plan" });
+    if (!telegram_id || !PLANS[plan]) {
+      return res.status(400).json({
+        ok: false,
+        message: "Invalid plan"
+      });
     }
 
     const result = await pool.query(
       `UPDATE users
-       SET plan=$1, min_withdraw=$2, plan_started_at=NOW()
+       SET pending_plan=$1,
+           pending_min_withdraw=$2
        WHERE telegram_id=$3
        RETURNING *`,
-      [plan, plans[plan], String(telegram_id)]
+      [plan, PLANS[plan].min_withdraw, String(telegram_id)]
     );
 
     if (!result.rows[0]) {
-      return res.status(404).json({ ok: false, message: "User not found" });
+      return res.status(404).json({
+        ok: false,
+        message: "User not found"
+      });
     }
 
-    res.json({ ok: true, user: result.rows[0] });
+    res.json({
+      ok: true,
+      message: "Plan selected. Deposit approval required.",
+      user: result.rows[0]
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, message: "Server error" });
@@ -133,7 +189,10 @@ app.post("/api/complete-task", async (req, res) => {
     const { telegram_id } = req.body;
 
     if (!telegram_id) {
-      return res.status(400).json({ ok: false, message: "telegram_id is required" });
+      return res.status(400).json({
+        ok: false,
+        message: "telegram_id is required"
+      });
     }
 
     const userResult = await pool.query(
@@ -144,7 +203,17 @@ app.post("/api/complete-task", async (req, res) => {
     const user = userResult.rows[0];
 
     if (!user) {
-      return res.status(404).json({ ok: false, message: "User not found" });
+      return res.status(404).json({
+        ok: false,
+        message: "User not found"
+      });
+    }
+
+    if (user.plan === "none") {
+      return res.status(400).json({
+        ok: false,
+        message: "Plan is not active yet"
+      });
     }
 
     if (user.last_task_at) {
@@ -166,7 +235,8 @@ app.post("/api/complete-task", async (req, res) => {
 
     const updated = await pool.query(
       `UPDATE users
-       SET balance = balance + $1, last_task_at = NOW()
+       SET balance = balance + $1,
+           last_task_at = NOW()
        WHERE telegram_id=$2
        RETURNING *`,
       [reward, String(telegram_id)]
@@ -194,11 +264,32 @@ app.post("/api/deposit", async (req, res) => {
       });
     }
 
+    const userResult = await pool.query(
+      "SELECT * FROM users WHERE telegram_id=$1",
+      [String(telegram_id)]
+    );
+
+    const user = userResult.rows[0];
+
+    if (!user) {
+      return res.status(404).json({
+        ok: false,
+        message: "User not found"
+      });
+    }
+
+    if (!user.pending_plan || user.pending_plan === "none") {
+      return res.status(400).json({
+        ok: false,
+        message: "Select a plan before submitting deposit"
+      });
+    }
+
     const result = await pool.query(
-      `INSERT INTO deposits (telegram_id, tx_hash)
-       VALUES ($1, $2)
+      `INSERT INTO deposits (telegram_id, tx_hash, requested_plan)
+       VALUES ($1, $2, $3)
        RETURNING *`,
-      [String(telegram_id), tx_hash]
+      [String(telegram_id), tx_hash, user.pending_plan]
     );
 
     res.json({
@@ -235,7 +326,10 @@ app.post("/api/withdraw", async (req, res) => {
     }
 
     if (user.plan === "none") {
-      return res.status(400).json({ ok: false, message: "Select a plan first" });
+      return res.status(400).json({
+        ok: false,
+        message: "Select a plan first"
+      });
     }
 
     if (numericAmount < Number(user.min_withdraw)) {
@@ -282,30 +376,14 @@ app.post("/api/withdraw", async (req, res) => {
     res.status(500).json({ ok: false, message: "Server error" });
   }
 });
-function requireAdmin(req, res, next) {
-  const key = req.query.key || req.headers["x-admin-key"];
 
-  if (!process.env.ADMIN_KEY) {
-    return res.status(500).json({
-      ok: false,
-      message: "ADMIN_KEY is missing"
-    });
-  }
-
-  if (key !== process.env.ADMIN_KEY) {
-    return res.status(401).json({
-      ok: false,
-      message: "Unauthorized"
-    });
-  }
-
-  next();
-}
 app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    const result = await pool.query(
+    await pool.query("BEGIN");
+
+    const depositResult = await pool.query(
       `UPDATE deposits
        SET status = 'approved'
        WHERE id = $1 AND status = 'pending'
@@ -313,18 +391,47 @@ app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
       [id]
     );
 
-    if (!result.rows[0]) {
+    const deposit = depositResult.rows[0];
+
+    if (!deposit) {
+      await pool.query("ROLLBACK");
       return res.status(404).json({
         ok: false,
         message: "Deposit not found or already processed"
       });
     }
 
+    const planName = deposit.requested_plan;
+
+    if (!PLANS[planName]) {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({
+        ok: false,
+        message: "Invalid requested plan"
+      });
+    }
+
+    const userResult = await pool.query(
+      `UPDATE users
+       SET plan = $1,
+           min_withdraw = $2,
+           plan_started_at = NOW(),
+           pending_plan = 'none',
+           pending_min_withdraw = 0
+       WHERE telegram_id = $3
+       RETURNING *`,
+      [planName, PLANS[planName].min_withdraw, deposit.telegram_id]
+    );
+
+    await pool.query("COMMIT");
+
     res.json({
       ok: true,
-      deposit: result.rows[0]
+      deposit,
+      user: userResult.rows[0]
     });
   } catch (err) {
+    await pool.query("ROLLBACK").catch(() => {});
     console.error(err);
     res.status(500).json({
       ok: false,
@@ -337,6 +444,8 @@ app.post("/api/admin/deposits/:id/reject", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
+    await pool.query("BEGIN");
+
     const result = await pool.query(
       `UPDATE deposits
        SET status = 'rejected'
@@ -345,18 +454,32 @@ app.post("/api/admin/deposits/:id/reject", requireAdmin, async (req, res) => {
       [id]
     );
 
-    if (!result.rows[0]) {
+    const deposit = result.rows[0];
+
+    if (!deposit) {
+      await pool.query("ROLLBACK");
       return res.status(404).json({
         ok: false,
         message: "Deposit not found or already processed"
       });
     }
 
+    await pool.query(
+      `UPDATE users
+       SET pending_plan = 'none',
+           pending_min_withdraw = 0
+       WHERE telegram_id = $1`,
+      [deposit.telegram_id]
+    );
+
+    await pool.query("COMMIT");
+
     res.json({
       ok: true,
-      deposit: result.rows[0]
+      deposit
     });
   } catch (err) {
+    await pool.query("ROLLBACK").catch(() => {});
     console.error(err);
     res.status(500).json({
       ok: false,
@@ -415,7 +538,6 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
 
     if (!withdrawal) {
       await pool.query("ROLLBACK");
-
       return res.status(404).json({
         ok: false,
         message: "Withdrawal not found or already processed"
@@ -445,6 +567,7 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
     });
   }
 });
+
 app.get("/api/admin", requireAdmin, async (req, res) => {
   try {
     const users = await pool.query("SELECT * FROM users ORDER BY id ASC");

@@ -301,6 +301,150 @@ function requireAdmin(req, res, next) {
 
   next();
 }
+app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `UPDATE deposits
+       SET status = 'approved'
+       WHERE id = $1 AND status = 'pending'
+       RETURNING *`,
+      [id]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        ok: false,
+        message: "Deposit not found or already processed"
+      });
+    }
+
+    res.json({
+      ok: true,
+      deposit: result.rows[0]
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
+  }
+});
+
+app.post("/api/admin/deposits/:id/reject", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `UPDATE deposits
+       SET status = 'rejected'
+       WHERE id = $1 AND status = 'pending'
+       RETURNING *`,
+      [id]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        ok: false,
+        message: "Deposit not found or already processed"
+      });
+    }
+
+    res.json({
+      ok: true,
+      deposit: result.rows[0]
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
+  }
+});
+
+app.post("/api/admin/withdrawals/:id/approve", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `UPDATE withdrawals
+       SET status = 'approved'
+       WHERE id = $1 AND status = 'pending'
+       RETURNING *`,
+      [id]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({
+        ok: false,
+        message: "Withdrawal not found or already processed"
+      });
+    }
+
+    res.json({
+      ok: true,
+      withdrawal: result.rows[0]
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
+  }
+});
+
+app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await pool.query("BEGIN");
+
+    const withdrawalResult = await pool.query(
+      `UPDATE withdrawals
+       SET status = 'rejected'
+       WHERE id = $1 AND status = 'pending'
+       RETURNING *`,
+      [id]
+    );
+
+    const withdrawal = withdrawalResult.rows[0];
+
+    if (!withdrawal) {
+      await pool.query("ROLLBACK");
+
+      return res.status(404).json({
+        ok: false,
+        message: "Withdrawal not found or already processed"
+      });
+    }
+
+    await pool.query(
+      `UPDATE users
+       SET balance = balance + $1
+       WHERE telegram_id = $2`,
+      [withdrawal.amount, withdrawal.telegram_id]
+    );
+
+    await pool.query("COMMIT");
+
+    res.json({
+      ok: true,
+      withdrawal
+    });
+  } catch (err) {
+    await pool.query("ROLLBACK").catch(() => {});
+    console.error(err);
+
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
+  }
+});
 app.get("/api/admin", requireAdmin, async (req, res) => {
   try {
     const users = await pool.query("SELECT * FROM users ORDER BY id ASC");

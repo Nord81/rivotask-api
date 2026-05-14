@@ -24,7 +24,7 @@ const pool = new Pool({
 
 const PLANS = {
   Basic: {
-    min_withdraw: 5,
+    min_withdraw: 3,
     reward: 1.2
   },
   Plus: {
@@ -94,6 +94,18 @@ async function initDB() {
     ADD COLUMN IF NOT EXISTS requested_plan TEXT DEFAULT 'none'
   `);
 
+  await pool.query(`
+    UPDATE users
+    SET min_withdraw = 3
+    WHERE plan = 'Basic'
+  `);
+
+  await pool.query(`
+    UPDATE users
+    SET pending_min_withdraw = 3
+    WHERE pending_plan = 'Basic'
+  `);
+
   console.log("Database ready");
 }
 
@@ -115,6 +127,22 @@ function requireAdmin(req, res, next) {
   }
 
   next();
+}
+
+async function withTransaction(callback) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+    const result = await callback(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 app.get("/", (req, res) => {
@@ -159,6 +187,7 @@ app.post("/api/user", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+
     res.status(500).json({
       ok: false,
       message: "Server error"
@@ -200,6 +229,7 @@ app.post("/api/select-plan", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+
     res.status(500).json({
       ok: false,
       message: "Server error"
@@ -252,6 +282,7 @@ app.post("/api/deposit", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+
     res.status(500).json({
       ok: false,
       message: "Server error"
@@ -321,6 +352,7 @@ app.post("/api/complete-task", async (req, res) => {
     });
   } catch (err) {
     console.error(err);
+
     res.status(500).json({
       ok: false,
       message: "Server error"
@@ -361,17 +393,19 @@ app.post("/api/withdraw", async (req, res) => {
       });
     }
 
-    if (numericAmount < Number(user.min_withdraw)) {
-      return res.status(400).json({
-        ok: false,
-        message: "Amount below minimum withdrawal"
-      });
-    }
-
     if (numericAmount > Number(user.balance)) {
       return res.status(400).json({
         ok: false,
         message: "Insufficient balance"
+      });
+    }
+
+    const isFirstWithdrawal = !user.last_withdrawal_at;
+
+    if (!isFirstWithdrawal && numericAmount < Number(user.min_withdraw)) {
+      return res.status(400).json({
+        ok: false,
+        message: "Amount below minimum withdrawal"
       });
     }
 
@@ -389,7 +423,7 @@ app.post("/api/withdraw", async (req, res) => {
       });
     }
 
-    if (user.last_withdrawal_at) {
+    if (!isFirstWithdrawal) {
       const lastWithdrawalTime = new Date(user.last_withdrawal_at).getTime();
       const threeDays = 3 * 24 * 60 * 60 * 1000;
       const nextAllowedTime = lastWithdrawalTime + threeDays;
@@ -405,32 +439,34 @@ app.post("/api/withdraw", async (req, res) => {
       }
     }
 
-    await pool.query("BEGIN");
+    const data = await withTransaction(async (client) => {
+      const withdrawal = await client.query(
+        `INSERT INTO withdrawals (telegram_id, amount, address)
+         VALUES ($1, $2, $3)
+         RETURNING *`,
+        [String(telegram_id), numericAmount, address]
+      );
 
-    const withdrawal = await pool.query(
-      `INSERT INTO withdrawals (telegram_id, amount, address)
-       VALUES ($1, $2, $3)
-       RETURNING *`,
-      [String(telegram_id), numericAmount, address]
-    );
+      const updatedUser = await client.query(
+        `UPDATE users
+         SET balance = balance - $1
+         WHERE telegram_id = $2
+         RETURNING *`,
+        [numericAmount, String(telegram_id)]
+      );
 
-    const updatedUser = await pool.query(
-      `UPDATE users
-       SET balance = balance - $1
-       WHERE telegram_id = $2
-       RETURNING *`,
-      [numericAmount, String(telegram_id)]
-    );
-
-    await pool.query("COMMIT");
+      return {
+        withdrawal: withdrawal.rows[0],
+        user: updatedUser.rows[0]
+      };
+    });
 
     res.json({
       ok: true,
-      withdrawal: withdrawal.rows[0],
-      user: updatedUser.rows[0]
+      withdrawal: data.withdrawal,
+      user: data.user
     });
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
     console.error(err);
 
     res.status(500).json({
@@ -444,64 +480,60 @@ app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    await pool.query("BEGIN");
+    const data = await withTransaction(async (client) => {
+      const depositResult = await client.query(
+        `UPDATE deposits
+         SET status = 'approved'
+         WHERE id = $1 AND status = 'pending'
+         RETURNING *`,
+        [id]
+      );
 
-    const depositResult = await pool.query(
-      `UPDATE deposits
-       SET status = 'approved'
-       WHERE id = $1 AND status = 'pending'
-       RETURNING *`,
-      [id]
-    );
+      const deposit = depositResult.rows[0];
 
-    const deposit = depositResult.rows[0];
+      if (!deposit) {
+        const error = new Error("Deposit not found or already processed");
+        error.statusCode = 404;
+        throw error;
+      }
 
-    if (!deposit) {
-      await pool.query("ROLLBACK");
+      const planName = deposit.requested_plan;
 
-      return res.status(404).json({
-        ok: false,
-        message: "Deposit not found or already processed"
-      });
-    }
+      if (!PLANS[planName]) {
+        const error = new Error("Invalid requested plan");
+        error.statusCode = 400;
+        throw error;
+      }
 
-    const planName = deposit.requested_plan;
+      const userResult = await client.query(
+        `UPDATE users
+         SET plan = $1,
+             min_withdraw = $2,
+             plan_started_at = NOW(),
+             pending_plan = 'none',
+             pending_min_withdraw = 0
+         WHERE telegram_id = $3
+         RETURNING *`,
+        [planName, PLANS[planName].min_withdraw, deposit.telegram_id]
+      );
 
-    if (!PLANS[planName]) {
-      await pool.query("ROLLBACK");
-
-      return res.status(400).json({
-        ok: false,
-        message: "Invalid requested plan"
-      });
-    }
-
-    const userResult = await pool.query(
-      `UPDATE users
-       SET plan = $1,
-           min_withdraw = $2,
-           plan_started_at = NOW(),
-           pending_plan = 'none',
-           pending_min_withdraw = 0
-       WHERE telegram_id = $3
-       RETURNING *`,
-      [planName, PLANS[planName].min_withdraw, deposit.telegram_id]
-    );
-
-    await pool.query("COMMIT");
+      return {
+        deposit,
+        user: userResult.rows[0]
+      };
+    });
 
     res.json({
       ok: true,
-      deposit,
-      user: userResult.rows[0]
+      deposit: data.deposit,
+      user: data.user
     });
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
     console.error(err);
 
-    res.status(500).json({
+    res.status(err.statusCode || 500).json({
       ok: false,
-      message: "Server error"
+      message: err.message || "Server error"
     });
   }
 });
@@ -510,48 +542,44 @@ app.post("/api/admin/deposits/:id/reject", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
-    await pool.query("BEGIN");
+    const data = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE deposits
+         SET status = 'rejected'
+         WHERE id = $1 AND status = 'pending'
+         RETURNING *`,
+        [id]
+      );
 
-    const result = await pool.query(
-      `UPDATE deposits
-       SET status = 'rejected'
-       WHERE id = $1 AND status = 'pending'
-       RETURNING *`,
-      [id]
-    );
+      const deposit = result.rows[0];
 
-    const deposit = result.rows[0];
+      if (!deposit) {
+        const error = new Error("Deposit not found or already processed");
+        error.statusCode = 404;
+        throw error;
+      }
 
-    if (!deposit) {
-      await pool.query("ROLLBACK");
+      await client.query(
+        `UPDATE users
+         SET pending_plan = 'none',
+             pending_min_withdraw = 0
+         WHERE telegram_id = $1`,
+        [deposit.telegram_id]
+      );
 
-      return res.status(404).json({
-        ok: false,
-        message: "Deposit not found or already processed"
-      });
-    }
-
-    await pool.query(
-      `UPDATE users
-       SET pending_plan = 'none',
-           pending_min_withdraw = 0
-       WHERE telegram_id = $1`,
-      [deposit.telegram_id]
-    );
-
-    await pool.query("COMMIT");
+      return { deposit };
+    });
 
     res.json({
       ok: true,
-      deposit
+      deposit: data.deposit
     });
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
     console.error(err);
 
-    res.status(500).json({
+    res.status(err.statusCode || 500).json({
       ok: false,
-      message: "Server error"
+      message: err.message || "Server error"
     });
   }
 });
@@ -560,47 +588,43 @@ app.post("/api/admin/withdrawals/:id/approve", requireAdmin, async (req, res) =>
   try {
     const { id } = req.params;
 
-    await pool.query("BEGIN");
+    const data = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE withdrawals
+         SET status = 'approved'
+         WHERE id = $1 AND status = 'pending'
+         RETURNING *`,
+        [id]
+      );
 
-    const result = await pool.query(
-      `UPDATE withdrawals
-       SET status = 'approved'
-       WHERE id = $1 AND status = 'pending'
-       RETURNING *`,
-      [id]
-    );
+      const withdrawal = result.rows[0];
 
-    const withdrawal = result.rows[0];
+      if (!withdrawal) {
+        const error = new Error("Withdrawal not found or already processed");
+        error.statusCode = 404;
+        throw error;
+      }
 
-    if (!withdrawal) {
-      await pool.query("ROLLBACK");
+      await client.query(
+        `UPDATE users
+         SET last_withdrawal_at = NOW()
+         WHERE telegram_id = $1`,
+        [withdrawal.telegram_id]
+      );
 
-      return res.status(404).json({
-        ok: false,
-        message: "Withdrawal not found or already processed"
-      });
-    }
-
-    await pool.query(
-      `UPDATE users
-       SET last_withdrawal_at = NOW()
-       WHERE telegram_id = $1`,
-      [withdrawal.telegram_id]
-    );
-
-    await pool.query("COMMIT");
+      return { withdrawal };
+    });
 
     res.json({
       ok: true,
-      withdrawal
+      withdrawal: data.withdrawal
     });
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
     console.error(err);
 
-    res.status(500).json({
+    res.status(err.statusCode || 500).json({
       ok: false,
-      message: "Server error"
+      message: err.message || "Server error"
     });
   }
 });
@@ -609,47 +633,48 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
   try {
     const { id } = req.params;
 
-    await pool.query("BEGIN");
+    const data = await withTransaction(async (client) => {
+      const withdrawalResult = await client.query(
+        `UPDATE withdrawals
+         SET status = 'rejected'
+         WHERE id = $1 AND status = 'pending'
+         RETURNING *`,
+        [id]
+      );
 
-    const withdrawalResult = await pool.query(
-      `UPDATE withdrawals
-       SET status = 'rejected'
-       WHERE id = $1 AND status = 'pending'
-       RETURNING *`,
-      [id]
-    );
+      const withdrawal = withdrawalResult.rows[0];
 
-    const withdrawal = withdrawalResult.rows[0];
+      if (!withdrawal) {
+        const error = new Error("Withdrawal not found or already processed");
+        error.statusCode = 404;
+        throw error;
+      }
 
-    if (!withdrawal) {
-      await pool.query("ROLLBACK");
+      const userResult = await client.query(
+        `UPDATE users
+         SET balance = balance + $1
+         WHERE telegram_id = $2
+         RETURNING *`,
+        [withdrawal.amount, withdrawal.telegram_id]
+      );
 
-      return res.status(404).json({
-        ok: false,
-        message: "Withdrawal not found or already processed"
-      });
-    }
-
-    await pool.query(
-      `UPDATE users
-       SET balance = balance + $1
-       WHERE telegram_id = $2`,
-      [withdrawal.amount, withdrawal.telegram_id]
-    );
-
-    await pool.query("COMMIT");
+      return {
+        withdrawal,
+        user: userResult.rows[0]
+      };
+    });
 
     res.json({
       ok: true,
-      withdrawal
+      withdrawal: data.withdrawal,
+      user: data.user
     });
   } catch (err) {
-    await pool.query("ROLLBACK").catch(() => {});
     console.error(err);
 
-    res.status(500).json({
+    res.status(err.statusCode || 500).json({
       ok: false,
-      message: "Server error"
+      message: err.message || "Server error"
     });
   }
 });

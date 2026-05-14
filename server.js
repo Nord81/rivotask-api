@@ -104,6 +104,7 @@ async function initDB() {
       telegram_id TEXT NOT NULL,
       amount NUMERIC(12,2) NOT NULL,
       address TEXT NOT NULL,
+      withdrawal_network TEXT DEFAULT 'unknown',
       status TEXT DEFAULT 'pending',
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
@@ -148,6 +149,11 @@ async function initDB() {
     ALTER TABLE deposits
     ALTER COLUMN tx_hash DROP NOT NULL
   `).catch(() => {});
+
+  await pool.query(`
+    ALTER TABLE withdrawals
+    ADD COLUMN IF NOT EXISTS withdrawal_network TEXT DEFAULT 'unknown'
+  `);
 
   await pool.query(`
     UPDATE users
@@ -650,13 +656,20 @@ app.post("/api/complete-task", requireTelegramAuth, async (req, res) => {
 
 app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
   try {
-    const { telegram_id, amount, address } = req.body;
+    const { telegram_id, amount, address, withdrawal_network } = req.body;
     const numericAmount = Number(amount);
 
-    if (!telegram_id || !numericAmount || numericAmount <= 0 || !address) {
+    if (!telegram_id || !numericAmount || numericAmount <= 0 || !address || !withdrawal_network) {
       return res.status(400).json({
         ok: false,
-        message: "telegram_id, amount and address are required"
+        message: "telegram_id, amount, address and withdrawal_network are required"
+      });
+    }
+
+    if (!DEPOSIT_NETWORKS[withdrawal_network]) {
+      return res.status(400).json({
+        ok: false,
+        message: "Invalid withdrawal network"
       });
     }
 
@@ -727,12 +740,19 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
       }
     }
 
+    const networkData = DEPOSIT_NETWORKS[withdrawal_network];
+
     const data = await withTransaction(async (client) => {
       const withdrawal = await client.query(
-        `INSERT INTO withdrawals (telegram_id, amount, address)
-         VALUES ($1, $2, $3)
+        `INSERT INTO withdrawals (
+          telegram_id,
+          amount,
+          address,
+          withdrawal_network
+        )
+         VALUES ($1, $2, $3, $4)
          RETURNING *`,
-        [String(telegram_id), numericAmount, address]
+        [String(telegram_id), numericAmount, address, withdrawal_network]
       );
 
       const updatedUser = await client.query(
@@ -756,6 +776,7 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
       `🆔 Telegram ID: <code>${escapeHtml(telegram_id)}</code>\n\n` +
       `📦 الباقة: <b>${escapeHtml(user.plan)}</b>\n` +
       `💰 المبلغ: <b>${escapeHtml(numericAmount)} USDT</b>\n` +
+      `🌐 شبكة السحب: <b>${escapeHtml(networkData.label)}</b>\n` +
       `🏦 عنوان السحب:\n<code>${escapeHtml(address)}</code>\n\n` +
       `افتح لوحة الأدمن وتأكد قبل القبول.`
     );

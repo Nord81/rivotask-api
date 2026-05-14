@@ -37,6 +37,21 @@ const PLANS = {
   }
 };
 
+const DEPOSIT_NETWORKS = {
+  ERC20: {
+    label: "Ethereum ERC20",
+    address: "0x9cd168333d6c0ce4b04b08ff857aa84a4ea007a9"
+  },
+  POLYGON: {
+    label: "Polygon USDT",
+    address: "0x9cd168333d6c0ce4b04b08ff857aa84a4ea007a9"
+  },
+  TRC20: {
+    label: "TRON TRC20",
+    address: "TE7eCxxD7GGvw1MDyfYLUfHuAx4vbRmNSp"
+  }
+};
+
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -95,6 +110,11 @@ async function initDB() {
   `);
 
   await pool.query(`
+    ALTER TABLE deposits
+    ADD COLUMN IF NOT EXISTS deposit_network TEXT DEFAULT 'unknown'
+  `);
+
+  await pool.query(`
     UPDATE users
     SET min_withdraw = 3
     WHERE plan = 'Basic'
@@ -149,6 +169,13 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     message: "RivoTask API is running with PostgreSQL"
+  });
+});
+
+app.get("/api/deposit-networks", (req, res) => {
+  res.json({
+    ok: true,
+    networks: DEPOSIT_NETWORKS
   });
 });
 
@@ -239,12 +266,19 @@ app.post("/api/select-plan", async (req, res) => {
 
 app.post("/api/deposit", async (req, res) => {
   try {
-    const { telegram_id, tx_hash } = req.body;
+    const { telegram_id, tx_hash, deposit_network } = req.body;
 
-    if (!telegram_id || !tx_hash) {
+    if (!telegram_id || !tx_hash || !deposit_network) {
       return res.status(400).json({
         ok: false,
-        message: "telegram_id and tx_hash are required"
+        message: "telegram_id, tx_hash and deposit_network are required"
+      });
+    }
+
+    if (!DEPOSIT_NETWORKS[deposit_network]) {
+      return res.status(400).json({
+        ok: false,
+        message: "Invalid deposit network"
       });
     }
 
@@ -270,10 +304,10 @@ app.post("/api/deposit", async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO deposits (telegram_id, tx_hash, requested_plan)
-       VALUES ($1, $2, $3)
+      `INSERT INTO deposits (telegram_id, tx_hash, requested_plan, deposit_network)
+       VALUES ($1, $2, $3, $4)
        RETURNING *`,
-      [String(telegram_id), tx_hash, user.pending_plan]
+      [String(telegram_id), tx_hash, user.pending_plan, deposit_network]
     );
 
     res.json({

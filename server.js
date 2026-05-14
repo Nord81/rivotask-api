@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
@@ -67,7 +68,8 @@ function escapeHtml(value) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 async function initDB() {
@@ -162,6 +164,101 @@ async function initDB() {
   console.log("Database ready");
 }
 
+function verifyTelegramInitData(initData) {
+  if (!initData) {
+    return { ok: false, message: "Missing Telegram initData" };
+  }
+
+  if (!process.env.BOT_TOKEN) {
+    return { ok: false, message: "BOT_TOKEN is missing" };
+  }
+
+  const params = new URLSearchParams(initData);
+  const hash = params.get("hash");
+
+  if (!hash) {
+    return { ok: false, message: "Missing Telegram hash" };
+  }
+
+  params.delete("hash");
+
+  const dataCheckString = Array.from(params.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+
+  const secretKey = crypto
+    .createHmac("sha256", "WebAppData")
+    .update(process.env.BOT_TOKEN)
+    .digest();
+
+  const calculatedHash = crypto
+    .createHmac("sha256", secretKey)
+    .update(dataCheckString)
+    .digest("hex");
+
+  const hashBuffer = Buffer.from(hash, "hex");
+  const calculatedBuffer = Buffer.from(calculatedHash, "hex");
+
+  if (
+    hashBuffer.length !== calculatedBuffer.length ||
+    !crypto.timingSafeEqual(hashBuffer, calculatedBuffer)
+  ) {
+    return { ok: false, message: "Invalid Telegram initData" };
+  }
+
+  const authDate = Number(params.get("auth_date") || 0);
+  const maxAgeSeconds = 7 * 24 * 60 * 60;
+
+  if (!authDate || Math.floor(Date.now() / 1000) - authDate > maxAgeSeconds) {
+    return { ok: false, message: "Telegram session expired" };
+  }
+
+  const userRaw = params.get("user");
+
+  if (!userRaw) {
+    return { ok: false, message: "Telegram user missing" };
+  }
+
+  let telegramUser;
+
+  try {
+    telegramUser = JSON.parse(userRaw);
+  } catch {
+    return { ok: false, message: "Invalid Telegram user data" };
+  }
+
+  if (!telegramUser.id) {
+    return { ok: false, message: "Telegram user id missing" };
+  }
+
+  return {
+    ok: true,
+    user: telegramUser
+  };
+}
+
+function requireTelegramAuth(req, res, next) {
+  const initData = req.headers["x-telegram-init-data"];
+  const verified = verifyTelegramInitData(initData);
+
+  if (!verified.ok) {
+    return res.status(401).json({
+      ok: false,
+      message: verified.message
+    });
+  }
+
+  req.telegramUser = verified.user;
+
+  req.body = req.body || {};
+  req.body.telegram_id = String(verified.user.id);
+  req.body.first_name = verified.user.first_name || "";
+  req.body.username = verified.user.username || "";
+
+  next();
+}
+
 function requireAdmin(req, res, next) {
   const key = req.query.key || req.headers["x-admin-key"];
 
@@ -251,16 +348,9 @@ app.get("/api/plans", (req, res) => {
   });
 });
 
-app.post("/api/user", async (req, res) => {
+app.post("/api/user", requireTelegramAuth, async (req, res) => {
   try {
     const { telegram_id, first_name, username } = req.body;
-
-    if (!telegram_id) {
-      return res.status(400).json({
-        ok: false,
-        message: "telegram_id is required"
-      });
-    }
 
     let result = await pool.query(
       "SELECT * FROM users WHERE telegram_id = $1",
@@ -275,6 +365,17 @@ app.post("/api/user", async (req, res) => {
          VALUES ($1, $2, $3)
          RETURNING *`,
         [String(telegram_id), first_name || "", username || ""]
+      );
+
+      user = result.rows[0];
+    } else {
+      result = await pool.query(
+        `UPDATE users
+         SET first_name = $1,
+             username = $2
+         WHERE telegram_id = $3
+         RETURNING *`,
+        [first_name || "", username || "", String(telegram_id)]
       );
 
       user = result.rows[0];
@@ -294,7 +395,7 @@ app.post("/api/user", async (req, res) => {
   }
 });
 
-app.post("/api/select-plan", async (req, res) => {
+app.post("/api/select-plan", requireTelegramAuth, async (req, res) => {
   try {
     const { telegram_id, plan } = req.body;
 
@@ -368,7 +469,7 @@ app.post("/api/select-plan", async (req, res) => {
   }
 });
 
-app.post("/api/deposit", async (req, res) => {
+app.post("/api/deposit", requireTelegramAuth, async (req, res) => {
   try {
     const { telegram_id, deposit_network } = req.body;
 
@@ -484,16 +585,9 @@ app.post("/api/deposit", async (req, res) => {
   }
 });
 
-app.post("/api/complete-task", async (req, res) => {
+app.post("/api/complete-task", requireTelegramAuth, async (req, res) => {
   try {
     const { telegram_id } = req.body;
-
-    if (!telegram_id) {
-      return res.status(400).json({
-        ok: false,
-        message: "telegram_id is required"
-      });
-    }
 
     const userResult = await pool.query(
       "SELECT * FROM users WHERE telegram_id = $1",
@@ -554,7 +648,7 @@ app.post("/api/complete-task", async (req, res) => {
   }
 });
 
-app.post("/api/withdraw", async (req, res) => {
+app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
   try {
     const { telegram_id, amount, address } = req.body;
     const numericAmount = Number(amount);

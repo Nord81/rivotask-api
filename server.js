@@ -62,6 +62,14 @@ function getPlanRank(plan) {
   return PLANS[plan]?.rank || 0;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -172,6 +180,38 @@ function requireAdmin(req, res, next) {
   }
 
   next();
+}
+
+async function notifyAdmin(message) {
+  try {
+    const botToken = process.env.BOT_TOKEN;
+    const adminId = process.env.ADMIN_TELEGRAM_ID;
+
+    if (!botToken || !adminId) {
+      console.log("Telegram notification skipped: BOT_TOKEN or ADMIN_TELEGRAM_ID missing");
+      return;
+    }
+
+    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        chat_id: adminId,
+        text: message,
+        parse_mode: "HTML"
+      })
+    });
+
+    const data = await res.json();
+
+    if (!data.ok) {
+      console.error("Telegram notification failed:", data);
+    }
+  } catch (err) {
+    console.error("Failed to send Telegram notification:", err.message);
+  }
 }
 
 async function withTransaction(callback) {
@@ -414,6 +454,18 @@ app.post("/api/deposit", async (req, res) => {
       ]
     );
 
+    await notifyAdmin(
+      `🔔 <b>طلب اشتراك جديد</b>\n\n` +
+      `👤 الاسم: <b>${escapeHtml(user.first_name || "-")}</b>\n` +
+      `🔗 Username: <b>@${escapeHtml(user.username || "-")}</b>\n` +
+      `🆔 Telegram ID: <code>${escapeHtml(telegram_id)}</code>\n\n` +
+      `📦 الباقة المطلوبة: <b>${escapeHtml(user.pending_plan)}</b>\n` +
+      `💰 المبلغ المطلوب: <b>${escapeHtml(planData.price)} USDT</b>\n` +
+      `🌐 الشبكة: <b>${escapeHtml(networkData.label)}</b>\n` +
+      `🏦 عنوان الإيداع:\n<code>${escapeHtml(networkData.address)}</code>\n\n` +
+      `افتح لوحة الأدمن للقبول أو الرفض.`
+    );
+
     res.json({
       ok: true,
       deposit: result.rows[0],
@@ -602,6 +654,17 @@ app.post("/api/withdraw", async (req, res) => {
         user: updatedUser.rows[0]
       };
     });
+
+    await notifyAdmin(
+      `💸 <b>طلب سحب جديد</b>\n\n` +
+      `👤 الاسم: <b>${escapeHtml(user.first_name || "-")}</b>\n` +
+      `🔗 Username: <b>@${escapeHtml(user.username || "-")}</b>\n` +
+      `🆔 Telegram ID: <code>${escapeHtml(telegram_id)}</code>\n\n` +
+      `📦 الباقة: <b>${escapeHtml(user.plan)}</b>\n` +
+      `💰 المبلغ: <b>${escapeHtml(numericAmount)} USDT</b>\n` +
+      `🏦 عنوان السحب:\n<code>${escapeHtml(address)}</code>\n\n` +
+      `افتح لوحة الأدمن وتأكد قبل القبول.`
+    );
 
     res.json({
       ok: true,

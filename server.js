@@ -617,13 +617,19 @@ app.post("/api/complete-task", requireTelegramAuth, async (req, res) => {
     }
 
     if (user.last_task_at) {
-      const last = new Date(user.last_task_at).toISOString().slice(0, 10);
-      const today = new Date().toISOString().slice(0, 10);
+      const lastTaskTime = new Date(user.last_task_at).getTime();
+      const cooldownMs = 24 * 60 * 60 * 1000;
+      const nextTaskTime = lastTaskTime + cooldownMs;
 
-      if (last === today) {
+      if (Date.now() < nextTaskTime) {
+        const remainingMs = nextTaskTime - Date.now();
+        const remainingSeconds = Math.ceil(remainingMs / 1000);
+
         return res.status(400).json({
           ok: false,
-          message: "Task already completed today"
+          message: "Task cooldown active",
+          remaining_seconds: remainingSeconds,
+          next_task_at: new Date(nextTaskTime).toISOString()
         });
       }
     }

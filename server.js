@@ -282,8 +282,26 @@ app.post("/api/withdraw", async (req, res) => {
     res.status(500).json({ ok: false, message: "Server error" });
   }
 });
+function requireAdmin(req, res, next) {
+  const key = req.query.key || req.headers["x-admin-key"];
 
-app.get("/api/admin", async (req, res) => {
+  if (!process.env.ADMIN_KEY) {
+    return res.status(500).json({
+      ok: false,
+      message: "ADMIN_KEY is missing"
+    });
+  }
+
+  if (key !== process.env.ADMIN_KEY) {
+    return res.status(401).json({
+      ok: false,
+      message: "Unauthorized"
+    });
+  }
+
+  next();
+}
+app.get("/api/admin", requireAdmin, async (req, res) => {
   try {
     const users = await pool.query("SELECT * FROM users ORDER BY id ASC");
     const deposits = await pool.query("SELECT * FROM deposits ORDER BY id DESC");

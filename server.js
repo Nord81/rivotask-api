@@ -24,16 +24,22 @@ const pool = new Pool({
 
 const PLANS = {
   Basic: {
+    price: 15,
     min_withdraw: 3,
-    reward: 1.2
+    reward: 1.2,
+    rank: 1
   },
   Plus: {
+    price: 60,
     min_withdraw: 20,
-    reward: 8.2
+    reward: 8.2,
+    rank: 2
   },
   Pro: {
+    price: 100,
     min_withdraw: 35,
-    reward: 12
+    reward: 12,
+    rank: 3
   }
 };
 
@@ -51,6 +57,10 @@ const DEPOSIT_NETWORKS = {
     address: "TE7eCxxD7GGvw1MDyfYLUfHuAx4vbRmNSp"
   }
 };
+
+function getPlanRank(plan) {
+  return PLANS[plan]?.rank || 0;
+}
 
 async function initDB() {
   await pool.query(`
@@ -72,7 +82,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS deposits (
       id SERIAL PRIMARY KEY,
       telegram_id TEXT NOT NULL,
-      tx_hash TEXT NOT NULL,
+      tx_hash TEXT,
       status TEXT DEFAULT 'pending',
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
@@ -113,6 +123,21 @@ async function initDB() {
     ALTER TABLE deposits
     ADD COLUMN IF NOT EXISTS deposit_network TEXT DEFAULT 'unknown'
   `);
+
+  await pool.query(`
+    ALTER TABLE deposits
+    ADD COLUMN IF NOT EXISTS required_amount NUMERIC(12,3) DEFAULT 0
+  `);
+
+  await pool.query(`
+    ALTER TABLE deposits
+    ADD COLUMN IF NOT EXISTS deposit_address TEXT DEFAULT ''
+  `);
+
+  await pool.query(`
+    ALTER TABLE deposits
+    ALTER COLUMN tx_hash DROP NOT NULL
+  `).catch(() => {});
 
   await pool.query(`
     UPDATE users
@@ -179,6 +204,13 @@ app.get("/api/deposit-networks", (req, res) => {
   });
 });
 
+app.get("/api/plans", (req, res) => {
+  res.json({
+    ok: true,
+    plans: PLANS
+  });
+});
+
 app.post("/api/user", async (req, res) => {
   try {
     const { telegram_id, first_name, username } = req.body;
@@ -233,6 +265,44 @@ app.post("/api/select-plan", async (req, res) => {
       });
     }
 
+    const userResult = await pool.query(
+      "SELECT * FROM users WHERE telegram_id = $1",
+      [String(telegram_id)]
+    );
+
+    const user = userResult.rows[0];
+
+    if (!user) {
+      return res.status(404).json({
+        ok: false,
+        message: "User not found"
+      });
+    }
+
+    const currentRank = getPlanRank(user.plan);
+    const requestedRank = getPlanRank(plan);
+
+    if (requestedRank <= currentRank) {
+      return res.status(400).json({
+        ok: false,
+        message: "You can only upgrade to a higher plan"
+      });
+    }
+
+    const pendingDeposit = await pool.query(
+      `SELECT id FROM deposits
+       WHERE telegram_id = $1 AND status = 'pending'
+       LIMIT 1`,
+      [String(telegram_id)]
+    );
+
+    if (pendingDeposit.rows[0]) {
+      return res.status(400).json({
+        ok: false,
+        message: "You already have a pending subscription request"
+      });
+    }
+
     const result = await pool.query(
       `UPDATE users
        SET pending_plan = $1,
@@ -242,17 +312,11 @@ app.post("/api/select-plan", async (req, res) => {
       [plan, PLANS[plan].min_withdraw, String(telegram_id)]
     );
 
-    if (!result.rows[0]) {
-      return res.status(404).json({
-        ok: false,
-        message: "User not found"
-      });
-    }
-
     res.json({
       ok: true,
-      message: "Plan selected. Deposit approval required.",
-      user: result.rows[0]
+      message: "Plan selected. Subscription request required.",
+      user: result.rows[0],
+      required_amount: PLANS[plan].price
     });
   } catch (err) {
     console.error(err);
@@ -266,12 +330,12 @@ app.post("/api/select-plan", async (req, res) => {
 
 app.post("/api/deposit", async (req, res) => {
   try {
-    const { telegram_id, tx_hash, deposit_network } = req.body;
+    const { telegram_id, deposit_network } = req.body;
 
-    if (!telegram_id || !tx_hash || !deposit_network) {
+    if (!telegram_id || !deposit_network) {
       return res.status(400).json({
         ok: false,
-        message: "telegram_id, tx_hash and deposit_network are required"
+        message: "telegram_id and deposit_network are required"
       });
     }
 
@@ -299,20 +363,64 @@ app.post("/api/deposit", async (req, res) => {
     if (!user.pending_plan || user.pending_plan === "none") {
       return res.status(400).json({
         ok: false,
-        message: "Select a plan before submitting deposit"
+        message: "Select a plan before submitting subscription request"
       });
     }
 
+    const currentRank = getPlanRank(user.plan);
+    const requestedRank = getPlanRank(user.pending_plan);
+
+    if (requestedRank <= currentRank) {
+      return res.status(400).json({
+        ok: false,
+        message: "You can only upgrade to a higher plan"
+      });
+    }
+
+    const pendingDeposit = await pool.query(
+      `SELECT id FROM deposits
+       WHERE telegram_id = $1 AND status = 'pending'
+       LIMIT 1`,
+      [String(telegram_id)]
+    );
+
+    if (pendingDeposit.rows[0]) {
+      return res.status(400).json({
+        ok: false,
+        message: "You already have a pending subscription request"
+      });
+    }
+
+    const planData = PLANS[user.pending_plan];
+    const networkData = DEPOSIT_NETWORKS[deposit_network];
+
     const result = await pool.query(
-      `INSERT INTO deposits (telegram_id, tx_hash, requested_plan, deposit_network)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO deposits (
+        telegram_id,
+        requested_plan,
+        deposit_network,
+        required_amount,
+        deposit_address,
+        status
+      )
+       VALUES ($1, $2, $3, $4, $5, 'pending')
        RETURNING *`,
-      [String(telegram_id), tx_hash, user.pending_plan, deposit_network]
+      [
+        String(telegram_id),
+        user.pending_plan,
+        deposit_network,
+        planData.price,
+        networkData.address
+      ]
     );
 
     res.json({
       ok: true,
-      deposit: result.rows[0]
+      deposit: result.rows[0],
+      required_amount: planData.price,
+      deposit_address: networkData.address,
+      deposit_network,
+      requested_plan: user.pending_plan
     });
   } catch (err) {
     console.error(err);
@@ -535,6 +643,25 @@ app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
 
       if (!PLANS[planName]) {
         const error = new Error("Invalid requested plan");
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const userBefore = await client.query(
+        `SELECT * FROM users WHERE telegram_id = $1`,
+        [deposit.telegram_id]
+      );
+
+      const user = userBefore.rows[0];
+
+      if (!user) {
+        const error = new Error("User not found");
+        error.statusCode = 404;
+        throw error;
+      }
+
+      if (getPlanRank(planName) <= getPlanRank(user.plan)) {
+        const error = new Error("User can only upgrade to a higher plan");
         error.statusCode = 400;
         throw error;
       }

@@ -29,7 +29,7 @@ const PLANS = {
   Pro: { price: 100, min_withdraw: 35, reward: 12, rank: 3 }
 };
 
-const DEPOSIT_NETWORKS = {
+const NETWORKS = {
   ERC20: {
     label: "Ethereum ERC20",
     address: "0x9cd168333d6c0ce4b04b08ff857aa84a4ea007a9"
@@ -43,6 +43,8 @@ const DEPOSIT_NETWORKS = {
     address: "TE7eCxxD7GGvw1MDyfYLUfHuAx4vbRmNSp"
   }
 };
+
+const DEPOSIT_NETWORKS = NETWORKS;
 
 function getPlanRank(plan) {
   return PLANS[plan]?.rank || 0;
@@ -270,13 +272,12 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-async function notifyAdmin(message) {
+async function sendTelegramMessage(chatId, message) {
   try {
     const botToken = process.env.BOT_TOKEN;
-    const adminId = process.env.ADMIN_TELEGRAM_ID;
 
-    if (!botToken || !adminId) {
-      console.log("Telegram notification skipped: BOT_TOKEN or ADMIN_TELEGRAM_ID missing");
+    if (!botToken || !chatId) {
+      console.log("Telegram message skipped: BOT_TOKEN or chatId missing");
       return;
     }
 
@@ -286,7 +287,7 @@ async function notifyAdmin(message) {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        chat_id: adminId,
+        chat_id: chatId,
         text: message,
         parse_mode: "HTML"
       })
@@ -295,11 +296,19 @@ async function notifyAdmin(message) {
     const data = await res.json();
 
     if (!data.ok) {
-      console.error("Telegram notification failed:", data);
+      console.error("Telegram message failed:", data);
     }
   } catch (err) {
-    console.error("Failed to send Telegram notification:", err.message);
+    console.error("Failed to send Telegram message:", err.message);
   }
+}
+
+async function notifyAdmin(message) {
+  await sendTelegramMessage(process.env.ADMIN_TELEGRAM_ID, message);
+}
+
+async function notifyUser(telegramId, message) {
+  await sendTelegramMessage(telegramId, message);
 }
 
 async function withTransaction(callback) {
@@ -544,7 +553,7 @@ app.post("/api/deposit", requireTelegramAuth, async (req, res) => {
       `💰 المبلغ المطلوب: <b>${escapeHtml(planData.price)} USDT</b>\n` +
       `🌐 الشبكة: <b>${escapeHtml(networkData.label)}</b>\n` +
       `🏦 عنوان الإيداع:\n<code>${escapeHtml(networkData.address)}</code>\n\n` +
-      `افتح لوحة الأدمن للقبول أو الرفض.`
+      `افتح لوحة النظام للقبول أو الرفض.`
     );
 
     res.json({
@@ -635,7 +644,7 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
       });
     }
 
-    if (!DEPOSIT_NETWORKS[withdrawal_network]) {
+    if (!NETWORKS[withdrawal_network]) {
       return res.status(400).json({
         ok: false,
         message: "Invalid withdrawal network"
@@ -700,7 +709,7 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
       }
     }
 
-    const networkData = DEPOSIT_NETWORKS[withdrawal_network];
+    const networkData = NETWORKS[withdrawal_network];
 
     const data = await withTransaction(async (client) => {
       const withdrawal = await client.query(
@@ -738,7 +747,17 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
       `💰 المبلغ: <b>${escapeHtml(numericAmount)} USDT</b>\n` +
       `🌐 شبكة السحب: <b>${escapeHtml(networkData.label)}</b>\n` +
       `🏦 عنوان السحب:\n<code>${escapeHtml(address)}</code>\n\n` +
-      `افتح لوحة الأدمن وتأكد قبل القبول.`
+      `افتح لوحة النظام وتأكد قبل القبول.`
+    );
+
+    await notifyUser(
+      telegram_id,
+      `💸 <b>تم استلام طلب السحب</b>\n\n` +
+      `💰 المبلغ: <b>${escapeHtml(numericAmount)} USDT</b>\n` +
+      `🌐 الشبكة: <b>${escapeHtml(networkData.label)}</b>\n\n` +
+      `طلبك الآن قيد المعالجة من النظام.\n` +
+      `⏳ لن يتأخر أكثر من 24 ساعة بالتأكيد.\n\n` +
+      `يرجى التأكد من أن عنوان المحفظة والشبكة صحيحان.`
     );
 
     res.json({
@@ -818,6 +837,13 @@ app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
       };
     });
 
+    await notifyUser(
+      data.user.telegram_id,
+      `✅ <b>تم قبول اشتراكك من النظام</b>\n\n` +
+      `📦 الباقة: <b>${escapeHtml(data.user.plan)}</b>\n` +
+      `🎉 يمكنك الآن تنفيذ المهام اليومية من التطبيق.`
+    );
+
     res.json({
       ok: true,
       deposit: data.deposit,
@@ -864,6 +890,12 @@ app.post("/api/admin/deposits/:id/reject", requireAdmin, async (req, res) => {
       return { deposit };
     });
 
+    await notifyUser(
+      data.deposit.telegram_id,
+      `❌ <b>تم رفض طلب الاشتراك من النظام</b>\n\n` +
+      `يرجى التأكد من إرسال مبلغ الاشتراك كاملًا وبنفس الشبكة المختارة، ثم أعد المحاولة.`
+    );
+
     res.json({ ok: true, deposit: data.deposit });
   } catch (err) {
     console.error(err);
@@ -904,6 +936,14 @@ app.post("/api/admin/withdrawals/:id/approve", requireAdmin, async (req, res) =>
 
       return { withdrawal };
     });
+
+    await notifyUser(
+      data.withdrawal.telegram_id,
+      `✅ <b>تم قبول طلب السحب من النظام</b>\n\n` +
+      `💰 المبلغ: <b>${escapeHtml(data.withdrawal.amount)} USDT</b>\n` +
+      `🌐 الشبكة: <b>${escapeHtml(data.withdrawal.withdrawal_network || "غير محدد")}</b>\n\n` +
+      `تمت معالجة طلبك بنجاح.`
+    );
 
     res.json({ ok: true, withdrawal: data.withdrawal });
   } catch (err) {
@@ -949,6 +989,13 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
         user: userResult.rows[0]
       };
     });
+
+    await notifyUser(
+      data.withdrawal.telegram_id,
+      `❌ <b>تم رفض طلب السحب من النظام</b>\n\n` +
+      `💰 المبلغ: <b>${escapeHtml(data.withdrawal.amount)} USDT</b>\n` +
+      `تم إرجاع المبلغ إلى رصيدك داخل التطبيق.`
+    );
 
     res.json({
       ok: true,
@@ -996,6 +1043,12 @@ app.post("/api/admin/users/:telegram_id/delete", requireAdmin, async (req, res) 
         user: deletedUser.rows[0]
       };
     });
+
+    await notifyUser(
+      telegramId,
+      `⚠️ <b>تم حذف حسابك من RivoTask بواسطة النظام</b>\n\n` +
+      `إذا كان هذا بالخطأ، يرجى التواصل مع الدعم.`
+    );
 
     res.json({
       ok: true,

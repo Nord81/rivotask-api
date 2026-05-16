@@ -50,6 +50,10 @@ function getPlanRank(plan) {
   return PLANS[plan]?.rank || 0;
 }
 
+function makeReferralCode(userId) {
+  return "RIVO" + String(userId).padStart(5, "0");
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -113,6 +117,31 @@ async function initDB() {
   `);
 
   await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS referral_code TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS referred_by TEXT
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS referral_bonus_received BOOLEAN DEFAULT false
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS team_approved_count INTEGER DEFAULT 0
+  `);
+
+  await pool.query(`
+    ALTER TABLE users
+    ADD COLUMN IF NOT EXISTS instant_withdraw_credit INTEGER DEFAULT 0
+  `);
+
+  await pool.query(`
     ALTER TABLE deposits
     ADD COLUMN IF NOT EXISTS requested_plan TEXT DEFAULT 'none'
   `);
@@ -143,6 +172,11 @@ async function initDB() {
   `);
 
   await pool.query(`
+    ALTER TABLE withdrawals
+    ADD COLUMN IF NOT EXISTS used_instant_withdraw_credit BOOLEAN DEFAULT false
+  `);
+
+  await pool.query(`
     UPDATE users
     SET min_withdraw = 3
     WHERE plan = 'Basic'
@@ -152,6 +186,17 @@ async function initDB() {
     UPDATE users
     SET pending_min_withdraw = 3
     WHERE pending_plan = 'Basic'
+  `);
+
+  await pool.query(`
+    UPDATE users
+    SET referral_code = 'RIVO' || LPAD(id::TEXT, 5, '0')
+    WHERE referral_code IS NULL OR referral_code = ''
+  `);
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_referral_code_unique
+    ON users(referral_code)
   `);
 
   console.log("Database ready");
@@ -281,7 +326,7 @@ async function sendTelegramMessage(chatId, message) {
       return;
     }
 
-    const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+    const response = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
@@ -293,7 +338,7 @@ async function sendTelegramMessage(chatId, message) {
       })
     });
 
-    const data = await res.json();
+    const data = await response.json();
 
     if (!data.ok) {
       console.error("Telegram message failed:", data);
@@ -368,11 +413,24 @@ app.post("/api/user", requireTelegramAuth, async (req, res) => {
       );
 
       user = result.rows[0];
+
+      const referralCode = makeReferralCode(user.id);
+
+      const updatedCode = await pool.query(
+        `UPDATE users
+         SET referral_code = $1
+         WHERE id = $2
+         RETURNING *`,
+        [referralCode, user.id]
+      );
+
+      user = updatedCode.rows[0];
     } else {
       result = await pool.query(
         `UPDATE users
          SET first_name = $1,
-             username = $2
+             username = $2,
+             referral_code = COALESCE(referral_code, 'RIVO' || LPAD(id::TEXT, 5, '0'))
          WHERE telegram_id = $3
          RETURNING *`,
         [first_name || "", username || "", String(telegram_id)]
@@ -381,10 +439,107 @@ app.post("/api/user", requireTelegramAuth, async (req, res) => {
       user = result.rows[0];
     }
 
-    res.json({ ok: true, user });
+    res.json({
+      ok: true,
+      user
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, message: "Server error" });
+
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
+  }
+});
+
+app.post("/api/apply-referral", requireTelegramAuth, async (req, res) => {
+  try {
+    const { telegram_id, referral_code } = req.body;
+    const code = String(referral_code || "").trim().toUpperCase();
+
+    if (!code) {
+      return res.status(400).json({
+        ok: false,
+        message: "Referral code is required"
+      });
+    }
+
+    const userResult = await pool.query(
+      `SELECT * FROM users WHERE telegram_id = $1`,
+      [String(telegram_id)]
+    );
+
+    const user = userResult.rows[0];
+
+    if (!user) {
+      return res.status(404).json({
+        ok: false,
+        message: "User not found"
+      });
+    }
+
+    if (user.referred_by) {
+      return res.status(400).json({
+        ok: false,
+        message: "Referral already applied"
+      });
+    }
+
+    if (user.plan !== "none" || user.pending_plan !== "none") {
+      return res.status(400).json({
+        ok: false,
+        message: "Referral code must be applied before subscription"
+      });
+    }
+
+    if (String(user.referral_code || "").toUpperCase() === code) {
+      return res.status(400).json({
+        ok: false,
+        message: "You cannot use your own referral code"
+      });
+    }
+
+    const referrerResult = await pool.query(
+      `SELECT * FROM users WHERE UPPER(referral_code) = $1`,
+      [code]
+    );
+
+    const referrer = referrerResult.rows[0];
+
+    if (!referrer) {
+      return res.status(404).json({
+        ok: false,
+        message: "Invalid referral code"
+      });
+    }
+
+    const updated = await pool.query(
+      `UPDATE users
+       SET referred_by = $1
+       WHERE telegram_id = $2
+       RETURNING *`,
+      [referrer.telegram_id, String(telegram_id)]
+    );
+
+    await notifyUser(
+      referrer.telegram_id,
+      `👥 <b>مستخدم جديد استخدم رمز دعوتك</b>\n\n` +
+      `سيتم احتسابه ضمن فريقك بعد قبول اشتراكه من النظام.`
+    );
+
+    res.json({
+      ok: true,
+      message: "Referral applied",
+      user: updated.rows[0]
+    });
+  } catch (err) {
+    console.error(err);
+
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
   }
 });
 
@@ -454,7 +609,11 @@ app.post("/api/select-plan", requireTelegramAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, message: "Server error" });
+
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
   }
 });
 
@@ -566,7 +725,11 @@ app.post("/api/deposit", requireTelegramAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, message: "Server error" });
+
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
   }
 });
 
@@ -582,7 +745,10 @@ app.post("/api/complete-task", requireTelegramAuth, async (req, res) => {
     const user = userResult.rows[0];
 
     if (!user) {
-      return res.status(404).json({ ok: false, message: "User not found" });
+      return res.status(404).json({
+        ok: false,
+        message: "User not found"
+      });
     }
 
     if (user.plan === "none") {
@@ -628,7 +794,11 @@ app.post("/api/complete-task", requireTelegramAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, message: "Server error" });
+
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
   }
 });
 
@@ -659,15 +829,24 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
     const user = userResult.rows[0];
 
     if (!user) {
-      return res.status(404).json({ ok: false, message: "User not found" });
+      return res.status(404).json({
+        ok: false,
+        message: "User not found"
+      });
     }
 
     if (user.plan === "none") {
-      return res.status(400).json({ ok: false, message: "Select a plan first" });
+      return res.status(400).json({
+        ok: false,
+        message: "Select a plan first"
+      });
     }
 
     if (numericAmount > Number(user.balance)) {
-      return res.status(400).json({ ok: false, message: "Insufficient balance" });
+      return res.status(400).json({
+        ok: false,
+        message: "Insufficient balance"
+      });
     }
 
     const isFirstWithdrawal = !user.last_withdrawal_at;
@@ -693,19 +872,25 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
       });
     }
 
+    let useInstantWithdrawCredit = false;
+
     if (!isFirstWithdrawal) {
       const lastWithdrawalTime = new Date(user.last_withdrawal_at).getTime();
       const threeDays = 3 * 24 * 60 * 60 * 1000;
       const nextAllowedTime = lastWithdrawalTime + threeDays;
 
       if (Date.now() < nextAllowedTime) {
-        const remainingMs = nextAllowedTime - Date.now();
-        const remainingHours = Math.ceil(remainingMs / (60 * 60 * 1000));
+        if (Number(user.instant_withdraw_credit || 0) > 0) {
+          useInstantWithdrawCredit = true;
+        } else {
+          const remainingMs = nextAllowedTime - Date.now();
+          const remainingHours = Math.ceil(remainingMs / (60 * 60 * 1000));
 
-        return res.status(400).json({
-          ok: false,
-          message: `You can withdraw again after ${remainingHours} hours`
-        });
+          return res.status(400).json({
+            ok: false,
+            message: `You can withdraw again after ${remainingHours} hours`
+          });
+        }
       }
     }
 
@@ -717,19 +902,32 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
           telegram_id,
           amount,
           address,
-          withdrawal_network
+          withdrawal_network,
+          used_instant_withdraw_credit
         )
-         VALUES ($1, $2, $3, $4)
+         VALUES ($1, $2, $3, $4, $5)
          RETURNING *`,
-        [String(telegram_id), numericAmount, address, withdrawal_network]
+        [
+          String(telegram_id),
+          numericAmount,
+          address,
+          withdrawal_network,
+          useInstantWithdrawCredit
+        ]
       );
 
       const updatedUser = await client.query(
         `UPDATE users
-         SET balance = balance - $1
+         SET balance = balance - $1,
+             instant_withdraw_credit =
+               CASE
+                 WHEN $3 = true AND instant_withdraw_credit > 0
+                 THEN instant_withdraw_credit - 1
+                 ELSE instant_withdraw_credit
+               END
          WHERE telegram_id = $2
          RETURNING *`,
-        [numericAmount, String(telegram_id)]
+        [numericAmount, String(telegram_id), useInstantWithdrawCredit]
       );
 
       return {
@@ -746,6 +944,7 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
       `📦 الباقة: <b>${escapeHtml(user.plan)}</b>\n` +
       `💰 المبلغ: <b>${escapeHtml(numericAmount)} USDT</b>\n` +
       `🌐 شبكة السحب: <b>${escapeHtml(networkData.label)}</b>\n` +
+      `⚡ سحب مباشر: <b>${useInstantWithdrawCredit ? "نعم" : "لا"}</b>\n` +
       `🏦 عنوان السحب:\n<code>${escapeHtml(address)}</code>\n\n` +
       `افتح لوحة النظام وتأكد قبل القبول.`
     );
@@ -760,14 +959,27 @@ app.post("/api/withdraw", requireTelegramAuth, async (req, res) => {
       `يرجى التأكد من أن عنوان المحفظة والشبكة صحيحان.`
     );
 
+    if (useInstantWithdrawCredit) {
+      await notifyUser(
+        telegram_id,
+        `⚡ <b>تم استخدام ميزة السحب المباشر</b>\n\n` +
+        `تم تجاوز انتظار 3 أيام لهذا الطلب مرة واحدة.`
+      );
+    }
+
     res.json({
       ok: true,
       withdrawal: data.withdrawal,
-      user: data.user
+      user: data.user,
+      used_instant_withdraw_credit: useInstantWithdrawCredit
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, message: "Server error" });
+
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
   }
 });
 
@@ -831,9 +1043,59 @@ app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
         [planName, PLANS[planName].min_withdraw, deposit.telegram_id]
       );
 
+      let finalUser = userResult.rows[0];
+      let referralReward = null;
+
+      if (
+        finalUser.referred_by &&
+        finalUser.referral_bonus_received === false
+      ) {
+        const bonusUser = await client.query(
+          `UPDATE users
+           SET balance = balance + 1,
+               referral_bonus_received = true
+           WHERE telegram_id = $1
+           RETURNING *`,
+          [finalUser.telegram_id]
+        );
+
+        finalUser = bonusUser.rows[0];
+
+        const referrerUpdate = await client.query(
+          `UPDATE users
+           SET team_approved_count = COALESCE(team_approved_count, 0) + 1
+           WHERE telegram_id = $1
+           RETURNING *`,
+          [finalUser.referred_by]
+        );
+
+        const referrer = referrerUpdate.rows[0];
+
+        let instantCreditAdded = false;
+
+        if (referrer && Number(referrer.team_approved_count) === 5) {
+          await client.query(
+            `UPDATE users
+             SET instant_withdraw_credit = COALESCE(instant_withdraw_credit, 0) + 1
+             WHERE telegram_id = $1`,
+            [referrer.telegram_id]
+          );
+
+          instantCreditAdded = true;
+        }
+
+        referralReward = {
+          new_user_bonus: 1,
+          referrer_telegram_id: finalUser.referred_by,
+          referrer_team_count: referrer ? referrer.team_approved_count : 0,
+          instant_credit_added: instantCreditAdded
+        };
+      }
+
       return {
         deposit,
-        user: userResult.rows[0]
+        user: finalUser,
+        referralReward
       };
     });
 
@@ -844,13 +1106,34 @@ app.post("/api/admin/deposits/:id/approve", requireAdmin, async (req, res) => {
       `🎉 يمكنك الآن تنفيذ المهام اليومية من التطبيق.`
     );
 
+    if (data.referralReward) {
+      await notifyUser(
+        data.user.telegram_id,
+        `🎁 <b>تم إضافة بونص الدعوة</b>\n\n` +
+        `تمت إضافة <b>1 USDT</b> إلى رصيدك بعد قبول اشتراكك.`
+      );
+
+      await notifyUser(
+        data.referralReward.referrer_telegram_id,
+        `👥 <b>عضو جديد انضم إلى فريقك</b>\n\n` +
+        `عدد أعضاء فريقك المقبولين الآن: <b>${escapeHtml(data.referralReward.referrer_team_count)} / 5</b>\n\n` +
+        (
+          data.referralReward.instant_credit_added
+            ? `🎉 حصلت على سحب مباشر مرة واحدة بدون انتظار 3 أيام.`
+            : `عند وصولك إلى 5 أعضاء مقبولين تحصل على سحب مباشر مرة واحدة.`
+        )
+      );
+    }
+
     res.json({
       ok: true,
       deposit: data.deposit,
-      user: data.user
+      user: data.user,
+      referralReward: data.referralReward
     });
   } catch (err) {
     console.error(err);
+
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -896,9 +1179,13 @@ app.post("/api/admin/deposits/:id/reject", requireAdmin, async (req, res) => {
       `يرجى التأكد من إرسال مبلغ الاشتراك كاملًا وبنفس الشبكة المختارة، ثم أعد المحاولة.`
     );
 
-    res.json({ ok: true, deposit: data.deposit });
+    res.json({
+      ok: true,
+      deposit: data.deposit
+    });
   } catch (err) {
     console.error(err);
+
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -945,9 +1232,13 @@ app.post("/api/admin/withdrawals/:id/approve", requireAdmin, async (req, res) =>
       `تمت معالجة طلبك بنجاح.`
     );
 
-    res.json({ ok: true, withdrawal: data.withdrawal });
+    res.json({
+      ok: true,
+      withdrawal: data.withdrawal
+    });
   } catch (err) {
     console.error(err);
+
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -978,10 +1269,20 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
 
       const userResult = await client.query(
         `UPDATE users
-         SET balance = balance + $1
+         SET balance = balance + $1,
+             instant_withdraw_credit =
+               CASE
+                 WHEN $3 = true
+                 THEN instant_withdraw_credit + 1
+                 ELSE instant_withdraw_credit
+               END
          WHERE telegram_id = $2
          RETURNING *`,
-        [withdrawal.amount, withdrawal.telegram_id]
+        [
+          withdrawal.amount,
+          withdrawal.telegram_id,
+          withdrawal.used_instant_withdraw_credit === true
+        ]
       );
 
       return {
@@ -997,6 +1298,14 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
       `تم إرجاع المبلغ إلى رصيدك داخل التطبيق.`
     );
 
+    if (data.withdrawal.used_instant_withdraw_credit === true) {
+      await notifyUser(
+        data.withdrawal.telegram_id,
+        `⚡ <b>تم إرجاع ميزة السحب المباشر</b>\n\n` +
+        `لأن طلب السحب تم رفضه، تمت إعادة ميزة السحب المباشر إلى حسابك.`
+      );
+    }
+
     res.json({
       ok: true,
       withdrawal: data.withdrawal,
@@ -1004,6 +1313,7 @@ app.post("/api/admin/withdrawals/:id/reject", requireAdmin, async (req, res) => 
     });
   } catch (err) {
     console.error(err);
+
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -1057,6 +1367,7 @@ app.post("/api/admin/users/:telegram_id/delete", requireAdmin, async (req, res) 
     });
   } catch (err) {
     console.error(err);
+
     res.status(err.statusCode || 500).json({
       ok: false,
       message: err.message || "Server error"
@@ -1080,7 +1391,11 @@ app.get("/api/admin", requireAdmin, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ ok: false, message: "Server error" });
+
+    res.status(500).json({
+      ok: false,
+      message: "Server error"
+    });
   }
 });
 
